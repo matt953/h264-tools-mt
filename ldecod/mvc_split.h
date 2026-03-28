@@ -26,6 +26,19 @@ typedef enum {
 } MVCRouteTarget;
 
 /*!
+ * \brief MVC Offset Metadata (OFMD) extracted from SEI messages
+ */
+#define OFMD_MAX_PLANES   32
+#define OFMD_MAX_FRAMES   250000  /* ~2.9 hours at 24fps */
+typedef struct {
+    int      num_planes;                      /*!< Number of 3D planes */
+    int      frame_count;                     /*!< Total frames accumulated so far */
+    int8_t  *offsets[OFMD_MAX_PLANES];        /*!< Per-plane offset arrays (heap allocated) */
+    int      offsets_capacity;                /*!< Allocated capacity per plane */
+    int      valid;                           /*!< 1 if OFMD was found and parsed */
+} OFMDData;
+
+/*!
  * \brief MVC stream splitter context
  */
 typedef struct {
@@ -46,6 +59,9 @@ typedef struct {
     int   is_first_nalu;
 
     volatile int stop;         /*!< Signal splitter thread to stop */
+
+    /* OFMD data extracted from mvc_scalable_nesting SEI messages */
+    OFMDData ofmd;
 } MVCSplitter;
 
 /*!

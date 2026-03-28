@@ -229,6 +229,127 @@ static int write_nalu_to_ring(ANNEXB_t *ring, const byte *nalu_data, int nalu_le
     return 0;
 }
 
+/* ---- OFMD extraction from SEI NALUs ---- */
+
+/*!
+ * \brief Search for "OFMD" magic bytes in a buffer.
+ * \return Pointer to the 'O' in "OFMD", or NULL if not found.
+ */
+static const byte *find_ofmd_magic(const byte *data, int len)
+{
+    int i;
+    for (i = 0; i <= len - 4; i++) {
+        if (data[i]   == 0x4F && data[i+1] == 0x46 &&
+            data[i+2] == 0x4D && data[i+3] == 0x44)
+            return &data[i];
+    }
+    return NULL;
+}
+
+/*!
+ * \brief Parse OFMD payload found within an mvc_scalable_nesting SEI.
+ *        Appends per-frame offsets to the splitter's OFMDData.
+ *
+ * OFMD binary format (from OFSExtractor / BD3D2MK3D):
+ *   Byte 0-3:  "OFMD" magic
+ *   Byte 4:    frame_rate (lower 4 bits)
+ *   Byte 5-9:  reserved
+ *   Byte 10:   num_planes (lower 7 bits)
+ *   Byte 11:   frame_count per this SEI message (lower 7 bits)
+ *   Byte 12-13: reserved
+ *   Byte 14+:  offset data [num_planes * frame_count bytes]
+ *              Layout: plane 0 frames first, then plane 1, etc.
+ *
+ * Offset encoding: 0-127 = positive, 128 = undefined, 129-255 = negative (128 - val)
+ */
+static void parse_ofmd_payload(MVCSplitter *s, const byte *ofmd, int remaining)
+{
+    OFMDData *d = &s->ofmd;
+    int frame_rate, num_planes, frame_count;
+    int data_needed, i, j;
+
+    if (remaining < 14)
+        return;
+
+    frame_rate = ofmd[4] & 0x0F;
+    if (frame_rate < 1 || frame_rate > 7)
+        return;
+
+    num_planes  = ofmd[10] & 0x7F;
+    frame_count = ofmd[11] & 0x7F;
+
+    if (num_planes <= 0 || num_planes > OFMD_MAX_PLANES || frame_count <= 0)
+        return;
+
+    data_needed = 14 + num_planes * frame_count;
+    if (remaining < data_needed)
+        return;
+
+    /* First OFMD message: initialize */
+    if (!d->valid) {
+        d->num_planes = num_planes;
+        d->frame_count = 0;
+        d->offsets_capacity = 4096;  /* initial capacity per plane */
+        for (i = 0; i < num_planes; i++) {
+            d->offsets[i] = (int8_t *)malloc(d->offsets_capacity * sizeof(int8_t));
+            if (!d->offsets[i]) return;
+        }
+        d->valid = 1;
+        fprintf(stderr, "[OFMD] Found OFMD: %d planes, frame_rate=%d\n",
+                num_planes, frame_rate);
+    }
+
+    /* Grow capacity if needed */
+    if (d->frame_count + frame_count > d->offsets_capacity) {
+        int new_cap = d->offsets_capacity;
+        while (new_cap < d->frame_count + frame_count)
+            new_cap *= 2;
+        if (new_cap > OFMD_MAX_FRAMES)
+            new_cap = OFMD_MAX_FRAMES;
+        for (i = 0; i < d->num_planes; i++) {
+            int8_t *new_buf = (int8_t *)realloc(d->offsets[i], new_cap * sizeof(int8_t));
+            if (!new_buf) return;
+            d->offsets[i] = new_buf;
+        }
+        d->offsets_capacity = new_cap;
+    }
+
+    /* Append offsets for each plane */
+    for (i = 0; i < d->num_planes && i < num_planes; i++) {
+        const byte *plane_data = ofmd + 14 + i * frame_count;
+        for (j = 0; j < frame_count; j++) {
+            byte raw = plane_data[j];
+            int8_t val;
+            if (raw <= 127)
+                val = (int8_t)raw;
+            else if (raw == 128)
+                val = 0;  /* undefined → treat as zero offset */
+            else
+                val = (int8_t)(128 - (int)raw);  /* 129→-1, 130→-2, etc. */
+            d->offsets[i][d->frame_count + j] = val;
+        }
+    }
+    d->frame_count += frame_count;
+}
+
+/*!
+ * \brief Scan a SEI NALU for OFMD payload within mvc_scalable_nesting messages.
+ *        The NALU data starts with the NAL header byte (type 6 = SEI).
+ */
+static void scan_sei_for_ofmd(MVCSplitter *s, const byte *nalu, int len)
+{
+    const byte *ofmd;
+
+    /* Quick scan: look for "OFMD" anywhere in the SEI NALU.
+     * This is what OFSExtractor does — the mvc_scalable_nesting header
+     * is variable-length, so scanning for the magic is the simplest approach. */
+    ofmd = find_ofmd_magic(nalu, len);
+    if (ofmd) {
+        int remaining = len - (int)(ofmd - nalu);
+        parse_ofmd_payload(s, ofmd, remaining);
+    }
+}
+
 /* ---- Public API ---- */
 
 void mvc_splitter_init(MVCSplitter *splitter, ANNEXB_t *input,
@@ -254,10 +375,17 @@ void mvc_splitter_init(MVCSplitter *splitter, ANNEXB_t *input,
 
 void mvc_splitter_free(MVCSplitter *splitter)
 {
+    int i;
     free(splitter->buf);
     splitter->buf = NULL;
     free(splitter->iobuffer);
     splitter->iobuffer = NULL;
+
+    /* Free OFMD data */
+    for (i = 0; i < OFMD_MAX_PLANES; i++) {
+        free(splitter->ofmd.offsets[i]);
+        splitter->ofmd.offsets[i] = NULL;
+    }
 }
 
 void *mvc_splitter_run(void *arg)
@@ -271,6 +399,14 @@ void *mvc_splitter_run(void *arg)
             break;
 
         /* s->buf[0..nalu_len-1] = NALU data (first byte = NAL header) */
+
+        /* Check SEI NALUs for OFMD data before routing */
+        {
+            int nal_type = s->buf[0] & 0x1f;
+            if (nal_type == 6)  /* SEI */
+                scan_sei_for_ofmd(s, s->buf, nalu_len);
+        }
+
         MVCRouteTarget target = classify_nalu(s->buf, nalu_len);
 
         {
