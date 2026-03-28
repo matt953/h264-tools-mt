@@ -30,6 +30,7 @@
 
 #include <math.h>
 #include <limits.h>
+#include <pthread.h>
 
 #include "global.h"
 #include "image.h"
@@ -115,47 +116,92 @@ static void init_mvc_picture(Slice *currSlice)
 {
   int i;
   VideoParameters *p_Vid = currSlice->p_Vid;
-  DecodedPictureBuffer *p_Dpb = p_Vid->p_Dpb_layer[0];
-
   StorablePicture *p_pic = NULL;
 
-  // find BL reconstructed picture
-  if (currSlice->structure  == FRAME)
+  // MT mode: get inter-view reference from iv_queue instead of DPB search
+  if (p_Vid->mt_mode && p_Vid->mt_iv_queue)
   {
-    for (i = 0; i < (int)p_Dpb->used_size/*size*/; i++)
-    {
-      FrameStore *fs = p_Dpb->fs[i];
-      if ((fs->frame->view_id == 0) && (fs->frame->frame_poc == currSlice->framepoc))
-      {
-        p_pic = fs->frame;
+    pthread_mutex_t *mtx = (pthread_mutex_t *)p_Vid->mt_iv_mutex;
+    pthread_cond_t  *cnd = (pthread_cond_t *)p_Vid->mt_iv_cond;
+
+    /* Queue entry layout must match h264decoder_mt.h iv_queue[] */
+    typedef struct {
+        StorablePicture *pic;
+        int poc;
+    } IVQueueEntry;
+
+    IVQueueEntry *queue = (IVQueueEntry *)p_Vid->mt_iv_queue;
+    int target_poc = currSlice->framepoc;
+
+    fprintf(stderr, "[MT-V1] waiting for iv_ref: framepoc=%d\n", target_poc);
+
+    pthread_mutex_lock(mtx);
+    while (*p_Vid->mt_iv_queue_count == 0) {
+      if (*p_Vid->mt_iv_queue_eof || (p_Vid->mt_shutdown && *p_Vid->mt_shutdown)) {
+        fprintf(stderr, "[MT-V1] iv_queue EOF/shutdown, no entry for poc=%d\n", target_poc);
         break;
       }
+      pthread_cond_wait(cnd, mtx);
     }
-  }
-  else if (currSlice->structure  == TOP_FIELD)
-  {
-    for (i = 0; i < (int)p_Dpb->used_size/*size*/; i++)
-    {
-      FrameStore *fs = p_Dpb->fs[i];
-      if ((fs->top_field->view_id == 0) && (fs->top_field->top_poc == currSlice->toppoc))
-      {
-        p_pic = fs->top_field;
-        break;
-      }
+    if (*p_Vid->mt_iv_queue_count > 0) {
+      int tail = *p_Vid->mt_iv_queue_tail;
+      p_pic = queue[tail].pic;
+      fprintf(stderr, "[MT-V1] FIFO pop: got poc=%d (expected %d) count=%d\n",
+              queue[tail].poc, target_poc, *p_Vid->mt_iv_queue_count - 1);
+      if (queue[tail].poc != target_poc)
+        fprintf(stderr, "[MT-V1] WARNING: POC mismatch! got %d expected %d\n",
+                queue[tail].poc, target_poc);
+      *p_Vid->mt_iv_queue_tail = (tail + 1) % 64;
+      (*p_Vid->mt_iv_queue_count)--;
+      pthread_cond_signal(cnd);
     }
+    pthread_mutex_unlock(mtx);
+
+    fprintf(stderr, "[MT-V1] got iv_ref: poc=%d\n", p_pic ? p_pic->frame_poc : -1);
   }
   else
   {
-    for (i = 0; i < (int)p_Dpb->used_size/*size*/; i++)
+    // Original: search View 0's DPB for matching POC
+    DecodedPictureBuffer *p_Dpb = p_Vid->p_Dpb_layer[0];
+
+    if (currSlice->structure  == FRAME)
     {
-      FrameStore *fs = p_Dpb->fs[i];
-      if ((fs->bottom_field->view_id == 0) && (fs->bottom_field->bottom_poc == currSlice->bottompoc))
+      for (i = 0; i < (int)p_Dpb->used_size; i++)
       {
-        p_pic = fs->bottom_field;
-        break;
+        FrameStore *fs = p_Dpb->fs[i];
+        if ((fs->frame->view_id == 0) && (fs->frame->frame_poc == currSlice->framepoc))
+        {
+          p_pic = fs->frame;
+          break;
+        }
+      }
+    }
+    else if (currSlice->structure  == TOP_FIELD)
+    {
+      for (i = 0; i < (int)p_Dpb->used_size; i++)
+      {
+        FrameStore *fs = p_Dpb->fs[i];
+        if ((fs->top_field->view_id == 0) && (fs->top_field->top_poc == currSlice->toppoc))
+        {
+          p_pic = fs->top_field;
+          break;
+        }
+      }
+    }
+    else
+    {
+      for (i = 0; i < (int)p_Dpb->used_size; i++)
+      {
+        FrameStore *fs = p_Dpb->fs[i];
+        if ((fs->bottom_field->view_id == 0) && (fs->bottom_field->bottom_poc == currSlice->bottompoc))
+        {
+          p_pic = fs->bottom_field;
+          break;
+        }
       }
     }
   }
+
   if(!p_pic)
   {
     p_Vid->bFrameInit = 0;
@@ -163,7 +209,12 @@ static void init_mvc_picture(Slice *currSlice)
   else
   {
     process_picture_in_dpb_s(p_Vid, p_pic);
-    store_proc_picture_in_dpb (currSlice->p_Dpb, clone_storable_picture(p_Vid, p_pic));
+    if (p_Vid->mt_mode && p_Vid->mt_iv_queue) {
+      /* p_pic is already a clone from the iv_queue — store directly */
+      store_proc_picture_in_dpb(currSlice->p_Dpb, p_pic);
+    } else {
+      store_proc_picture_in_dpb(currSlice->p_Dpb, clone_storable_picture(p_Vid, p_pic));
+    }
   }
 }
 #endif
@@ -206,6 +257,19 @@ static void init_picture(VideoParameters *p_Vid, Slice *currSlice, InputParamete
     currSlice->frame_num != p_Vid->pre_frame_num &&
     currSlice->frame_num != (p_Vid->pre_frame_num + 1) % p_Vid->max_frame_num)
   {
+#if (MVC_EXTENSION_ENABLE)
+    /* MT mode: dependent view doesn't receive IDR NALUs, so pre_frame_num
+     * is never reset by IDR processing. When frame_num wraps to 0 at a
+     * GOP boundary, treat it as a valid reset (matching single-threaded
+     * behavior where both views shared pre_frame_num).
+     * Also skip fill_frame_num_gap — this is NOT a real gap. */
+    if (p_Vid->mt_mode && currSlice->view_id == 1 && currSlice->frame_num == 0)
+    {
+      p_Vid->pre_frame_num = 0;
+      goto mt_gap_handled;
+    }
+    else
+#endif
     if (active_sps->gaps_in_frame_num_value_allowed_flag == 0)
     {
       // picture error concealment
@@ -239,6 +303,7 @@ static void init_picture(VideoParameters *p_Vid, Slice *currSlice, InputParamete
     if(p_Vid->conceal_mode == 0)
       fill_frame_num_gap(p_Vid, currSlice);
   }
+mt_gap_handled:
 
   if(currSlice->nal_reference_idc)
   {
@@ -1992,7 +2057,14 @@ void exit_picture(VideoParameters *p_Vid, StorablePicture **dec_picture)
 
   chroma_format_idc = (*dec_picture)->chroma_format_idc;
 #if MVC_EXTENSION_ENABLE
-  store_picture_in_dpb(p_Vid->p_Dpb_layer[(*dec_picture)->view_id], *dec_picture);
+  {
+    StorablePicture *pic_for_dpb = *dec_picture;
+    store_picture_in_dpb(p_Vid->p_Dpb_layer[pic_for_dpb->view_id], pic_for_dpb);
+
+    // MT mode: notify coordinator when View 0 frame is stored in DPB
+    if (p_Vid->mt_mode && p_Vid->mt_frame_done && pic_for_dpb->view_id == 0)
+      p_Vid->mt_frame_done(p_Vid, pic_for_dpb);
+  }
 #else
   store_picture_in_dpb(p_Vid->p_Dpb_layer[0], *dec_picture);
 #endif

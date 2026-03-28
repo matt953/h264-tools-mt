@@ -436,10 +436,14 @@ int annex_b_ring_feed(ANNEXB_t *annex_b, const byte *data, int size)
   {
     pthread_mutex_lock(&annex_b->ring_mutex);
 
-    // Wait until space is available
+    // Wait until space is available (or abort)
     int64_t space = annex_b->ring_size - (annex_b->ring_write - annex_b->ring_read);
     while (space <= 0)
     {
+      if (annex_b->ring_abort) {
+        pthread_mutex_unlock(&annex_b->ring_mutex);
+        return written > 0 ? written : -1;
+      }
       pthread_cond_wait(&annex_b->ring_cond, &annex_b->ring_mutex);
       space = annex_b->ring_size - (annex_b->ring_write - annex_b->ring_read);
     }
@@ -522,7 +526,7 @@ void annex_b_ring_signal_eof(ANNEXB_t *annex_b)
 {
   pthread_mutex_lock(&annex_b->ring_mutex);
   annex_b->ring_eof = 1;
-  pthread_cond_signal(&annex_b->ring_cond);
+  pthread_cond_broadcast(&annex_b->ring_cond);
   pthread_mutex_unlock(&annex_b->ring_mutex);
 }
 

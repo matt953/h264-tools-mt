@@ -35,6 +35,7 @@ typedef struct annex_b_struct
   volatile int64_t ring_write;       //!< write position (producer/FFmpeg thread)
   volatile int64_t ring_read;        //!< read position (consumer/decoder thread)
   volatile int ring_eof;             //!< producer signals no more data
+  volatile int ring_abort;           //!< abort all blocking operations
   pthread_mutex_t ring_mutex;
   pthread_cond_t  ring_cond;
 } ANNEXB_t;

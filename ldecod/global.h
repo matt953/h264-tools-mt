@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <setjmp.h>
 #include <assert.h>
 #include <time.h>
 #include <sys/timeb.h>
@@ -45,7 +46,7 @@
 typedef struct bit_stream_dec Bitstream;
 
 #define ET_SIZE 300      //!< size of error text buffer
-extern char errortext[ET_SIZE]; //!< buffer for error message for exit with error()
+extern __thread char errortext[ET_SIZE]; //!< buffer for error message for exit with error()
 
 struct pic_motion_params_old;
 struct pic_motion_params;
@@ -950,6 +951,26 @@ typedef struct video_par
 /******************* end deprecative variables; ***************************************/
 
   struct dec_stat_parameters *dec_stats;
+
+  // MT inter-view reference support (used by dual-instance MVC decoder)
+  int mt_mode;                                 //!< 0 = normal single-instance, 1 = MT dual-instance
+  struct storable_picture *mt_iv_ref;          //!< Inter-view reference from View 0 (set by coordinator)
+  int mt_iv_ref_poc;                           //!< POC of the available inter-view reference
+  int mt_iv_ref_valid;                         //!< Whether mt_iv_ref is available
+  void *mt_iv_mutex;                           //!< pthread_mutex_t* - protects mt_iv_ref (View 1)
+  void *mt_iv_cond;                            //!< pthread_cond_t* - signals new inter-view ref (View 1)
+  // Callback: View 0 calls this after storing a frame in DPB.
+  // The coordinator uses it to provide the picture to View 1.
+  void (*mt_frame_done)(struct video_par *p_Vid, struct storable_picture *pic);
+  void *mt_frame_done_ctx;                     //!< Opaque context for mt_frame_done callback
+
+  // IV queue access pointers (set by coordinator, used by View 1 in image.c)
+  void *mt_iv_queue;                           //!< pointer to iv_queue[] array
+  int  *mt_iv_queue_head;                      //!< pointer to head index
+  int  *mt_iv_queue_tail;                      //!< pointer to tail index
+  int  *mt_iv_queue_count;                     //!< pointer to count
+  int  *mt_iv_queue_eof;                       //!< pointer to eof flag
+  volatile int *mt_shutdown;                   //!< pointer to global shutdown flag
 } VideoParameters;
 
 
@@ -1046,9 +1067,12 @@ typedef struct decoder_params
   int                UsedBits;      // for internal statistics, is adjusted by read_se_v, read_ue_v, read_u_1
   FILE              *p_trace;        //!< Trace file
   int                bitcounter;
+  jmp_buf            error_jmp;      //!< longjmp target for error() in MT mode
+  int                use_error_jmp;  //!< if set, error() longjmps instead of exit()
+  int                error_code;     //!< error code from last error() call
 } DecoderParams;
 
-extern DecoderParams  *p_Dec;
+extern __thread DecoderParams  *p_Dec;
 
 // prototypes
 extern void error(char *text, int code);

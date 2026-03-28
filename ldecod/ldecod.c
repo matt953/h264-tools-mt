@@ -76,8 +76,8 @@
 
 // Decoder definition. This should be the only global variable in the entire
 // software. Global variables should be avoided.
-DecoderParams  *p_Dec;
-char errortext[ET_SIZE];
+__thread DecoderParams  *p_Dec;
+__thread char errortext[ET_SIZE];
 
 // Prototypes of static functions
 static void Report      (VideoParameters *p_Vid);
@@ -100,6 +100,12 @@ void init_frext(VideoParameters *p_Vid);
 void error(char *text, int code)
 {
   fprintf(stderr, "%s\n", text);
+  if (p_Dec && p_Dec->use_error_jmp)
+  {
+    /* MT mode: don't call exit(), jump back to the decode loop */
+    p_Dec->error_code = code;
+    longjmp(p_Dec->error_jmp, 1);
+  }
   if (p_Dec)
   {
     flush_dpb(p_Dec->p_Vid->p_Dpb_layer[0]);

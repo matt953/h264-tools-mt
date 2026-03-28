@@ -23,9 +23,9 @@
 #include "fast_memory.h"
 #include "h264decoder.h"
 
-/* Global raw picture callback (set via SetRawPicOutput) */
-static RawPicOutputFunc g_raw_pic_func = NULL;
-static void *g_raw_pic_ctx = NULL;
+/* Thread-local raw picture callback (set via SetRawPicOutput) */
+static __thread RawPicOutputFunc g_raw_pic_func = NULL;
+static __thread void *g_raw_pic_ctx = NULL;
 
 void SetRawPicOutput(RawPicOutputFunc func, void *ctx)
 {
