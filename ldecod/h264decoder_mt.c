@@ -321,6 +321,10 @@ MVCDecoderMT *OpenDecoderMT(InputParameters *p_Inp, int ring_size, ANNEXB_t **pp
 
     /* Configure View 1 for MT mode: install inter-view reference queue mechanism */
     mt->dec[1]->p_Vid->mt_mode = 1;
+    /* V1 never sees IDR NALUs (type=5, routed only to V0), so recovery_point_found
+     * stays 0 and read_new_slice() silently discards all slices. Force it to 1
+     * so that V1 will accept MVC dependent view slices (type=20→SLICE). */
+    mt->dec[1]->p_Vid->recovery_point_found = 1;
     mt->dec[1]->p_Vid->mt_iv_mutex = &mt->iv_mutex;
     mt->dec[1]->p_Vid->mt_iv_cond = &mt->iv_cond;
     mt->dec[1]->p_Vid->mt_iv_queue = mt->iv_queue;
