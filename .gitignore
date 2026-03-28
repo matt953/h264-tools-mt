@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.d
+*.gcda
+*.gcno
+*.DS_Store
+.DS_Store
+log.dec
+dataDec.txt

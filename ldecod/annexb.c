@@ -42,6 +42,11 @@ void init_annex_b(ANNEXB_t *annex_b)
   annex_b->is_eof = FALSE;
   annex_b->IsFirstByteStreamNALU = 1;
   annex_b->nextstartcodebytes = 0;
+  annex_b->ring_buf = NULL;
+  annex_b->ring_size = 0;
+  annex_b->ring_write = 0;
+  annex_b->ring_read = 0;
+  annex_b->ring_eof = 0;
 }
 
 void free_annex_b(ANNEXB_t **p_annex_b)
@@ -58,9 +63,59 @@ void free_annex_b(ANNEXB_t **p_annex_b)
 *    fill IO buffer
 ************************************************************************
 */
+static inline int getChunk_ring(ANNEXB_t *annex_b)
+{
+  unsigned int readbytes = 0;
+  int mask = annex_b->ring_size - 1;
+
+  pthread_mutex_lock(&annex_b->ring_mutex);
+
+  // Wait until data is available or EOF
+  while (annex_b->ring_read == annex_b->ring_write && !annex_b->ring_eof)
+    pthread_cond_wait(&annex_b->ring_cond, &annex_b->ring_mutex);
+
+  int64_t avail = annex_b->ring_write - annex_b->ring_read;
+  if (avail <= 0)
+  {
+    pthread_mutex_unlock(&annex_b->ring_mutex);
+    annex_b->is_eof = TRUE;
+    return 0;
+  }
+
+  readbytes = (avail < annex_b->iIOBufferSize) ? (int)avail : annex_b->iIOBufferSize;
+
+  // Copy from ring buffer (may wrap around)
+  int rpos = (int)(annex_b->ring_read & mask);
+  int first = annex_b->ring_size - rpos;
+  if ((int)readbytes <= first)
+  {
+    memcpy(annex_b->iobuffer, annex_b->ring_buf + rpos, readbytes);
+  }
+  else
+  {
+    memcpy(annex_b->iobuffer, annex_b->ring_buf + rpos, first);
+    memcpy(annex_b->iobuffer + first, annex_b->ring_buf, readbytes - first);
+  }
+  annex_b->ring_read += readbytes;
+
+  // Signal producer that space is available
+  pthread_cond_signal(&annex_b->ring_cond);
+  pthread_mutex_unlock(&annex_b->ring_mutex);
+
+  annex_b->bytesinbuffer = readbytes;
+  annex_b->iobufferread = annex_b->iobuffer;
+
+  return readbytes;
+}
+
 static inline int getChunk(ANNEXB_t *annex_b)
 {
-  unsigned int readbytes = read (annex_b->BitStreamFile, annex_b->iobuffer, annex_b->iIOBufferSize); 
+  unsigned int readbytes;
+
+  if (annex_b->BitStreamFile == -2)
+    return getChunk_ring(annex_b);
+
+  readbytes = read (annex_b->BitStreamFile, annex_b->iobuffer, annex_b->iIOBufferSize);
   if (0==readbytes)
   {
     annex_b->is_eof = TRUE;
@@ -332,14 +387,162 @@ void open_annex_b (char *fn, ANNEXB_t *annex_b)
  *    Closes the bit stream file
  ************************************************************************
  */
+/*!
+ ************************************************************************
+ * \brief
+ *    Opens annex B in ring buffer mode for memory-based feeding.
+ *    The ring_size must be a power of 2.
+ ************************************************************************
+ */
+void open_annex_b_ring(int ring_size, ANNEXB_t *annex_b)
+{
+  if (NULL != annex_b->iobuffer)
+    error("open_annex_b_ring: tried to open Annex B twice", 500);
+
+  annex_b->BitStreamFile = -2;  // sentinel for ring buffer mode
+
+  annex_b->ring_buf = (byte *)malloc(ring_size);
+  if (NULL == annex_b->ring_buf)
+    error("open_annex_b_ring: cannot allocate ring buffer", 500);
+  annex_b->ring_size = ring_size;
+  annex_b->ring_read = 0;
+  annex_b->ring_write = 0;
+  annex_b->ring_eof = 0;
+  pthread_mutex_init(&annex_b->ring_mutex, NULL);
+  pthread_cond_init(&annex_b->ring_cond, NULL);
+
+  annex_b->iIOBufferSize = IOBUFFERSIZE * sizeof(byte);
+  annex_b->iobuffer = malloc(annex_b->iIOBufferSize);
+  if (NULL == annex_b->iobuffer)
+    error("open_annex_b_ring: cannot allocate IO buffer", 500);
+
+  annex_b->is_eof = FALSE;
+  // Don't call getChunk here - ring is empty, decoder thread will pull when ready
+}
+
+/*!
+ ************************************************************************
+ * \brief
+ *    Feed data into the ring buffer (called from producer/FFmpeg thread).
+ *    Blocks if ring buffer is full. Returns bytes written.
+ ************************************************************************
+ */
+int annex_b_ring_feed(ANNEXB_t *annex_b, const byte *data, int size)
+{
+  int written = 0;
+  int mask = annex_b->ring_size - 1;
+
+  while (written < size)
+  {
+    pthread_mutex_lock(&annex_b->ring_mutex);
+
+    // Wait until space is available
+    int64_t space = annex_b->ring_size - (annex_b->ring_write - annex_b->ring_read);
+    while (space <= 0)
+    {
+      pthread_cond_wait(&annex_b->ring_cond, &annex_b->ring_mutex);
+      space = annex_b->ring_size - (annex_b->ring_write - annex_b->ring_read);
+    }
+
+    int to_write = size - written;
+    if (to_write > (int)space) to_write = (int)space;
+
+    // Copy to ring buffer (may wrap around)
+    int wpos = (int)(annex_b->ring_write & mask);
+    int first = annex_b->ring_size - wpos;
+    if (to_write <= first)
+    {
+      memcpy(annex_b->ring_buf + wpos, data + written, to_write);
+    }
+    else
+    {
+      memcpy(annex_b->ring_buf + wpos, data + written, first);
+      memcpy(annex_b->ring_buf, data + written + first, to_write - first);
+    }
+    annex_b->ring_write += to_write;
+    written += to_write;
+
+    // Signal consumer that data is available
+    pthread_cond_signal(&annex_b->ring_cond);
+    pthread_mutex_unlock(&annex_b->ring_mutex);
+  }
+
+  return written;
+}
+
+/*!
+ ************************************************************************
+ * \brief
+ *    Non-blocking feed: write as much as fits into the ring buffer
+ *    without waiting. Returns number of bytes actually written.
+ ************************************************************************
+ */
+int annex_b_ring_try_feed(ANNEXB_t *annex_b, const byte *data, int size)
+{
+  int mask = annex_b->ring_size - 1;
+
+  pthread_mutex_lock(&annex_b->ring_mutex);
+
+  int64_t space = annex_b->ring_size - (annex_b->ring_write - annex_b->ring_read);
+  if (space <= 0)
+  {
+    pthread_mutex_unlock(&annex_b->ring_mutex);
+    return 0;
+  }
+
+  int to_write = size;
+  if (to_write > (int)space) to_write = (int)space;
+
+  int wpos = (int)(annex_b->ring_write & mask);
+  int first = annex_b->ring_size - wpos;
+  if (to_write <= first)
+  {
+    memcpy(annex_b->ring_buf + wpos, data, to_write);
+  }
+  else
+  {
+    memcpy(annex_b->ring_buf + wpos, data, first);
+    memcpy(annex_b->ring_buf, data + first, to_write - first);
+  }
+  annex_b->ring_write += to_write;
+
+  pthread_cond_signal(&annex_b->ring_cond);
+  pthread_mutex_unlock(&annex_b->ring_mutex);
+
+  return to_write;
+}
+
+/*!
+ ************************************************************************
+ * \brief
+ *    Signal EOF on the ring buffer (no more data will be fed).
+ ************************************************************************
+ */
+void annex_b_ring_signal_eof(ANNEXB_t *annex_b)
+{
+  pthread_mutex_lock(&annex_b->ring_mutex);
+  annex_b->ring_eof = 1;
+  pthread_cond_signal(&annex_b->ring_cond);
+  pthread_mutex_unlock(&annex_b->ring_mutex);
+}
+
 void close_annex_b(ANNEXB_t *annex_b)
 {
-  if (annex_b->BitStreamFile != -1)
+  if (annex_b->BitStreamFile == -2)
+  {
+    // Ring buffer mode
+    pthread_mutex_destroy(&annex_b->ring_mutex);
+    pthread_cond_destroy(&annex_b->ring_cond);
+    free(annex_b->ring_buf);
+    annex_b->ring_buf = NULL;
+    annex_b->BitStreamFile = -1;
+  }
+  else if (annex_b->BitStreamFile != -1)
   {
     close(annex_b->BitStreamFile);
-    annex_b->BitStreamFile = - 1;
+    annex_b->BitStreamFile = -1;
   }
-  free (annex_b->iobuffer);
+  free(annex_b->iobuffer);
   annex_b->iobuffer = NULL;
 }
 

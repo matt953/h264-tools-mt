@@ -236,7 +236,7 @@ enum {
   G_COMP = 4,    // G Component
   B_COMP = 5,    // B Component
   T_COMP = 6
-} ColorComponent;
+};
 
 enum {
   EOS = 1,    //!< End Of Sequence

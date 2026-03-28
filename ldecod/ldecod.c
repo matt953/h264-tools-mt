@@ -28,7 +28,7 @@
  *     H.264/AVC reference decoder project main()
  *  \author
  *     Main contributors (see contributors.h for copyright, address and affiliation details)
- *     - Inge Lille-Langøy       <inge.lille-langoy@telenor.com>
+ *     - Inge Lille-Langï¿½y       <inge.lille-langoy@telenor.com>
  *     - Rickard Sjoberg         <rickard.sjoberg@era.ericsson.se>
  *     - Stephan Wenger          <stewe@cs.tu-berlin.de>
  *     - Jani Lainema            <jani.lainema@nokia.com>
@@ -1234,6 +1234,75 @@ int OpenDecoder(InputParameters *p_Inp)
 #if _FLTDBG_
   pDecoder->p_Vid->fpDbg = fopen("c:/fltdbg.txt", "a");
   fprintf(pDecoder->p_Vid->fpDbg, "\ndecoder is opened.\n");
+#endif
+
+  return DEC_OPEN_NOERR;
+}
+
+/*!
+ ***********************************************************************
+ * \brief
+ *    Open decoder in ring buffer mode for memory-based feeding.
+ *    Same as OpenDecoder but uses a ring buffer instead of file I/O.
+ *    Caller feeds data via annex_b_ring_feed() on the returned annex_b.
+ * \param p_Inp
+ *    Input parameters (infile is ignored)
+ * \param ring_size
+ *    Ring buffer size in bytes (must be power of 2, e.g. 4*1024*1024)
+ * \param pp_annex_b
+ *    Output: pointer to the ANNEXB_t for feeding data
+ * \return
+ *    DEC_OPEN_NOERR on success
+ ***********************************************************************
+ */
+int OpenDecoderRing(InputParameters *p_Inp, int ring_size, ANNEXB_t **pp_annex_b)
+{
+  int iRet;
+  DecoderParams *pDecoder;
+
+  iRet = alloc_decoder(&p_Dec);
+  if(iRet)
+    return (iRet|DEC_ERRMASK);
+
+  init_time();
+
+  pDecoder = p_Dec;
+  memcpy(pDecoder->p_Inp, p_Inp, sizeof(InputParameters));
+  pDecoder->p_Vid->conceal_mode = p_Inp->conceal_mode;
+  pDecoder->p_Vid->ref_poc_gap = p_Inp->ref_poc_gap;
+  pDecoder->p_Vid->poc_gap = p_Inp->poc_gap;
+
+#if TRACE
+  if ((pDecoder->p_trace = fopen(TRACEFILE,"w"))==0)
+    return -1;
+#endif
+
+  // No file output in ring buffer mode.
+  // Use -2 instead of -1: output.c returns early on p_out==-1 which
+  // skips populating pDecOuputPic. With -2, the early return is bypassed
+  // while "if (p_out >= 0)" guards still prevent actual file writes.
+  {
+    int i;
+    VideoParameters *p_Vid = pDecoder->p_Vid;
+    p_Vid->p_out = -2;
+    for(i = 0; i < MAX_VIEW_NUM; i++)
+      p_Vid->p_out_mvc[i] = -2;
+  }
+  pDecoder->p_Vid->p_ref = -1;
+
+  // Open annex B in ring buffer mode
+  malloc_annex_b(pDecoder->p_Vid, &pDecoder->p_Vid->annex_b);
+  open_annex_b_ring(ring_size, pDecoder->p_Vid->annex_b);
+  *pp_annex_b = pDecoder->p_Vid->annex_b;
+
+  init_old_slice(pDecoder->p_Vid->old_slice);
+  init(pDecoder->p_Vid);
+  init_out_buffer(pDecoder->p_Vid);
+
+#if (MVC_EXTENSION_ENABLE)
+  pDecoder->p_Vid->active_sps = NULL;
+  pDecoder->p_Vid->active_subset_sps = NULL;
+  init_subset_sps_list(pDecoder->p_Vid->SubsetSeqParSet, MAXSPS);
 #endif
 
   return DEC_OPEN_NOERR;

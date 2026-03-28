@@ -21,6 +21,17 @@
 #include "sei.h"
 #include "input.h"
 #include "fast_memory.h"
+#include "h264decoder.h"
+
+/* Global raw picture callback (set via SetRawPicOutput) */
+static RawPicOutputFunc g_raw_pic_func = NULL;
+static void *g_raw_pic_ctx = NULL;
+
+void SetRawPicOutput(RawPicOutputFunc func, void *ctx)
+{
+    g_raw_pic_func = func;
+    g_raw_pic_ctx = ctx;
+}
 
 static void write_out_picture(VideoParameters *p_Vid, StorablePicture *p, int p_out);
 static void img2buf_byte   (imgpel** imgX, unsigned char* buf, int size_x, int size_y, int symbol_size_in_bytes, int crop_left, int crop_right, int crop_top, int crop_bottom, int iOutStride);
@@ -463,6 +474,9 @@ static void allocate_p_dec_pic(VideoParameters *p_Vid, DecodedPicList *pDecPic, 
 */
 static void write_out_picture(VideoParameters *p_Vid, StorablePicture *p, int p_out)
 {
+  static int skip_output = -1;
+  if (skip_output == -1) skip_output = (getenv("LDECOD_NO_OUTPUT") != NULL);
+  if (skip_output) return;
   InputParameters *p_Inp = p_Vid->p_Inp;
   DecodedPicList *pDecPic;
 
@@ -516,9 +530,25 @@ static void write_out_picture(VideoParameters *p_Vid, StorablePicture *p, int p_
 
   //printf ("write frame size: %dx%d\n", p->size_x-crop_left-crop_right,p->size_y-crop_top-crop_bottom );
 
-  // We need to further cleanup this function
-  if (p_out == -1)
+  // Raw picture callback: bypass img2buf entirely, give direct access to imgpel**
+  if (g_raw_pic_func) {
+    RawDecodedPic rpic;
+    rpic.imgY     = p->imgY;
+    rpic.imgU     = (p->chroma_format_idc != YUV400) ? p->imgUV[0] : NULL;
+    rpic.imgV     = (p->chroma_format_idc != YUV400) ? p->imgUV[1] : NULL;
+    rpic.width    = iLumaSizeX;
+    rpic.height   = iLumaSizeY;
+    rpic.width_cr = iChromaSizeX;
+    rpic.height_cr= iChromaSizeY;
+    rpic.crop_x   = crop_left;
+    rpic.crop_y   = crop_top;
+    rpic.crop_x_cr= p->frame_cropping_flag ? p->frame_crop_left_offset : 0;
+    rpic.crop_y_cr= p->frame_cropping_flag ? ((2 - p->frame_mbs_only_flag) * p->frame_crop_top_offset) : 0;
+    rpic.view_id  = p->view_id;
+    rpic.poc      = p->frame_poc;
+    g_raw_pic_func(g_raw_pic_ctx, &rpic);
     return;
+  }
 
 
 

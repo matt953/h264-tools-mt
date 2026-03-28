@@ -64,6 +64,8 @@
 #include "memalloc.h"
 #include "config_common.h"
 #include "configfile.h"
+
+InputParameters cfgparams;
 #define MAX_ITEMS_TO_PARSE  10000
 
 static void PatchInp                (InputParameters *p_Inp);

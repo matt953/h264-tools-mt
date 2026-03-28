@@ -93,18 +93,20 @@ void DeblockPicture(VideoParameters *p_Vid, StorablePicture *p)
   int iheightMBs =(p_Vid->PicSizeInMbs/p_Vid->PicWidthInMbs);
   unsigned int i, k = p->PicWidthInMbs + 2 * (iheightMBs - 1);
 
+  {
+    int j;
 #if defined(OPENMP)
-  int j;
     #pragma omp parallel for
 #endif
-  for (j = 0; j < p->PicSizeInMbs; ++j)
-  {
-    get_db_strength( p_Vid, p, j ) ;
+    for (j = 0; j < (int)p->PicSizeInMbs; ++j)
+    {
+      get_db_strength( p_Vid, p, j ) ;
+    }
   }
- 
+
   for (i = 0; i < k; i++)
   {
-    int nn;    
+    int nn;
     int n_last = imin(iheightMBs, (i >> 1) + 1);
     int n_start = (i < p->PicWidthInMbs) ? 0 : ((i - p->PicWidthInMbs) >> 1) + 1;
 
